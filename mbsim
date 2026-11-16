@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""mbsim - build and run a micro:bit CODAL program on your desktop, with no board attached."""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+CACHE = Path.home() / ".cache" / "mbsim"
+INCLUDE = REPO / "include"
+
+EXIT_COMPILE = 2
+EXIT_RESET = 75
+
+# The same language options CODAL uses for the micro:bit v2 (codal-microbit-v2/target.json),
+# so code that the real build rejects (exceptions, RTTI) is rejected here too.
+CXX_FLAGS = ["-std=c++11", "-fwrapv", "-fno-rtti", "-fno-threadsafe-statics", "-fno-exceptions"]
+C_FLAGS = ["-std=c99"]
+COMMON_FLAGS = ["-O1", "-g", "-fno-omit-frame-pointer"]
+# Thumb-2 with integer divide (sdiv/udiv), as on the Cortex-M4. "+fp" is needed because the
+# arm-linux-gnueabihf toolchain uses the hard-float ABI and plain armv7ve has no FPU.
+ARM_FLAGS = ["-march=armv7ve+fp", "-mthumb"]
+ASAN_FLAGS = ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
+
+SAMPLES_MESSAGE = "CODAL sample demos aren't supported. Replace main.cpp with your own program."
+
+FIDELITY = """\
+mbsim gets behaviour close, not identical. Always do a real CODAL build and test on the
+board before relying on the result. In particular:
+  - code between uBit.sleep() calls takes almost no time here; a lag on the board won't show
+  - out-of-bounds array writes may or may not crash here (use --asan to catch them)
+  - warnings come from desktop g++, not arm-none-eabi-g++; 'long' is 64-bit here
+  - there is no real sound, only its timing
+  - uBit.serial output is shown in the serial pane; on the real board it is only visible
+    in a serial terminal at 115200 baud
+See "Known fidelity limits" in README.md for the full list."""
+
+KEYS = """\
+keys while running:
+  a / b      click button A / B (held for 120 ms)
+  A / B      long click (held for 1100 ms)
+  z / x      toggle holding A / B down
+  space      press A and B together
+  l          touch the logo
+  r          reset: restart the program, like the button on the back of the board
+  p          freeze / unfreeze simulated time
+  e          show / hide the event log
+  g          show / hide the x/y labels around the grid
+  q, Ctrl+C  quit"""
+
+
+def say(msg=""):
+    print(msg, file=sys.stderr)
+
+
+def die(msg, code=EXIT_COMPILE):
+    say(f"mbsim: {msg}")
+    sys.exit(code)
+
+
+def which(*names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+# ------------------------------------------------------------------------------ sources
+
+def find_sources(path):
+    """Returns (source folder, [source files], display name)."""
+    p = Path(path).expanduser()
+    if not p.exists():
+        die(f"{path}: no such file or folder")
+    p = p.resolve()
+
+    if p.is_file():
+        if p.suffix not in (".cpp", ".c", ".S"):
+            die(f"{path}: expected a main.cpp or a folder")
+        return p.parent, [p], p.name
+
+    files, skipped = [], False
+    for f in sorted(p.rglob("*")):
+        if not f.is_file() or f.suffix not in (".cpp", ".c", ".S"):
+            continue
+        rel = f.relative_to(p).parts
+        if "samples" in rel[:-1]:
+            skipped = True
+            continue
+        if any(part.startswith(".") for part in rel):
+            continue
+        files.append(f)
+    if skipped:
+        say("mbsim: skipping the samples/ folder (CODAL's demo programs are not part of your program)")
+    if not files:
+        die(f"{path}: no .cpp, .c or .S files found")
+    name = "main.cpp" if (p / "main.cpp").exists() else p.name + "/"
+    return p, files, name
+
+
+def check_no_samples(files):
+    pat = re.compile(r'^\s*#\s*include\s*["<]samples/', re.M)
+    for f in files:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError as e:
+            die(f"cannot read {f}: {e}")
+        if pat.search(text):
+            die(SAMPLES_MESSAGE)
+
+
+# Assembler directives that name an M-profile core. They are right for the board but clash
+# with linking a desktop (A-profile) ARM binary.
+M_PROFILE = re.compile(
+    r"^\s*\.(?:cpu\s+cortex-m\S*|arch\s+armv\d+(?:\.\d+)?e?-m\S*|fpu\s+fpv[45]-\S+)\s*(?:[@/].*)?$",
+    re.I)
+ARM_MODE = re.compile(r"^\s*\.(?:arm|code\s+32)\b", re.I)
+
+
+def prepare_asm(src, build_dir, index):
+    """Copies a .S file into the build folder with M-profile directives commented out.
+    The user's file is never modified. Returns the copy's path."""
+    lines = src.read_text(errors="replace").split("\n")
+    changed, arm_mode = [], False
+    out = [f'# 1 "{src}"']  # so the assembler's messages name the user's file and line
+    for no, line in enumerate(lines, 1):
+        if M_PROFILE.match(line):
+            changed.append(f"line {no} '{line.strip()}'")
+            out.append("@ mbsim: disabled for the desktop build: " + line.strip())
+        else:
+            out.append(line)
+        if ARM_MODE.match(line):
+            arm_mode = True
+    if changed:
+        say(f"mbsim: {src.name}: ignoring {', '.join(changed)} for the desktop build "
+            f"(your file is not modified)")
+    if arm_mode:
+        say(f"mbsim: warning: {src.name}: The micro:bit's Cortex-M4 can only run Thumb code. "
+            f"This file won't work on the board as written.")
+    copy = build_dir / f"{index:02d}-{src.name}"
+    copy.write_text("\n".join(out))
+    return copy
+
+
+# -------------------------------------------------------------------------------- build
+
+class Toolchain:
+    def __init__(self, arm, asan):
+        self.arm, self.asan = arm, asan
+        if arm:
+            self.cxx = which("arm-linux-gnueabihf-g++")
+            self.cc = which("arm-linux-gnueabihf-gcc")
+            self.nm = which("arm-linux-gnueabihf-nm", "nm")
+            self.qemu = which("qemu-arm", "qemu-arm-static")
+            if not self.cxx or not self.cc:
+                die("assembly mode needs the ARM cross compiler:\n"
+                    "    sudo apt install g++-arm-linux-gnueabihf qemu-user\n"
+                    "(a .S file in the folder, or --arm, turns assembly mode on)")
+            self.target = "arm"
+        else:
+            self.cxx = which("g++")
+            self.cc = which("gcc")
+            self.nm = which("nm")
+            self.qemu = None
+            if not self.cxx or not self.cc:
+                die("g++ not found:\n    sudo apt install build-essential")
+            self.target = "native-asan" if asan else "native"
+        self.lib = CACHE / f"lib-{self.target}.a"
+
+    def ensure_lib(self):
+        if not which("make"):
+            die("make not found:\n    sudo apt install build-essential")
+        goal = {"native": "native", "native-asan": "asan", "arm": "arm"}[self.target]
+        r = subprocess.run(["make", "-s", "-C", str(REPO), goal, f"CACHE={CACHE}"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not self.lib.exists():
+            say(r.stdout + r.stderr)
+            die("could not build the mbsim runtime library (this is a problem with mbsim, "
+                "not with your program)")
+
+
+def colour_flag():
+    return ["-fdiagnostics-color=always"] if sys.stderr.isatty() else []
+
+
+def summarise_errors(output, src_dir):
+    """Lists the errors that are in the user's own files."""
+    plain = re.sub(r"\x1b\[[0-9;]*[mK]", "", output)
+    seen, found = set(), []
+    for m in re.finditer(r"^(/[^:\n]+):(\d+)(?::\d+)?: (?:fatal )?error: (.*)$", plain, re.M):
+        path = Path(m.group(1))
+        try:
+            rel = path.resolve().relative_to(src_dir)
+        except ValueError:
+            continue
+        key = (str(rel), m.group(2), m.group(3))
+        if key not in seen:
+            seen.add(key)
+            found.append(f"  {rel}:{m.group(2)}: {m.group(3)}")
+    return found
+
+
+def build(args, check_only=False):
+    """Compiles (and links) the user's program. Returns (binary or None, toolchain, info)."""
+    src_dir, files, name = find_sources(args.path)
+    check_no_samples(files)
+
+    has_asm = any(f.suffix == ".S" for f in files)
+    arm = bool(getattr(args, "arm", False)) or has_asm
+    asan = bool(getattr(args, "asan", False))
+    if asan and arm:
+        why = "there is a .S file" if has_asm else "--arm was given"
+        die(f"--asan only works in native mode, and this build is in assembly mode because {why}")
+    if has_asm and not getattr(args, "arm", False):
+        say("mbsim: a .S file is present: building for 32-bit ARM and running under qemu-arm "
+            "(assembly mode)")
+
+    tc = Toolchain(arm, asan)
+    tc.ensure_lib()
+
+    build_id = hashlib.sha1(str(Path(args.path).expanduser().resolve()).encode()).hexdigest()[:12]
+    build_dir = CACHE / "build" / f"{build_id}-{tc.target}"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+
+    include_dirs = sorted({str(f.parent) for f in files} | {str(src_dir)})
+    base = COMMON_FLAGS + ["-isystem", str(INCLUDE)] + [x for d in include_dirs for x in ("-I", d)]
+    if arm:
+        base += ARM_FLAGS
+    if asan:
+        base += ASAN_FLAGS
+    if check_only:
+        base += ["-Wall", "-Wextra"]
+    base += colour_flag()
+
+    objs, failed, all_output = [], False, ""
+    for i, f in enumerate(files):
+        obj = build_dir / f"{i:02d}-{f.stem}.o"
+        if f.suffix == ".cpp":
+            cmd = [tc.cxx] + CXX_FLAGS + base + ["-c", str(f), "-o", str(obj)]
+        elif f.suffix == ".c":
+            cmd = [tc.cc] + C_FLAGS + base + ["-c", str(f), "-o", str(obj)]
+        else:
+            if not arm:
+                die("internal error: .S file in a native build")
+            copy = prepare_asm(f, build_dir, i)
+            cmd = [tc.cxx] + base + ["-c", str(copy), "-o", str(obj)]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(build_dir))
+        out = r.stdout + r.stderr
+        if out.strip():
+            sys.stderr.write(out if out.endswith("\n") else out + "\n")
+        all_output += out
+        if r.returncode != 0:
+            failed = True
+        objs.append(obj)
+
+    if failed:
+        errs = summarise_errors(all_output, src_dir)
+        say("mbsim: build failed." + (" Errors in your code:" if errs else ""))
+        for e in errs:
+            say(e)
+        sys.exit(EXIT_COMPILE)
+
+    info = {"src_dir": src_dir, "name": name, "build_dir": build_dir, "build_id": build_id}
+    if check_only:
+        return None, tc, info
+
+    binary = build_dir / "program"
+    link = [tc.cxx] + [str(o) for o in objs] + [str(tc.lib), "-o", str(binary),
+                                                "-Wl,--wrap=main", "-pthread"]
+    if arm:
+        link += ARM_FLAGS + ["-static"]
+    else:
+        link += ["-rdynamic", "-ldl"]
+    if asan:
+        link += ASAN_FLAGS
+    r = subprocess.run(link + colour_flag(), capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    # glibc warns about dladdr in static programs; it works, and isn't the user's concern.
+    out = "\n".join(l for l in out.split("\n")
+                    if "statically linked applications requires at runtime" not in l
+                    and "in function `resolve" not in l and "in function `(anonymous" not in l)
+    if out.strip():
+        sys.stderr.write(out + "\n")
+    if r.returncode != 0:
+        say("mbsim: linking failed.")
+        if "undefined reference" in out:
+            if Path(args.path).is_file():
+                say("  If your program is split over several files (for example a .S file), "
+                    "pass the folder instead of main.cpp.")
+            if "__real_main" in out:
+                say("  No main() was found. Your program needs an int main().")
+        sys.exit(EXIT_COMPILE)
+
+    # A list of function names, so the event log can name handlers (including static ones).
+    info["symbols"] = None
+    if tc.nm:
+        r = subprocess.run([tc.nm, "-C", "--defined-only", str(binary)], capture_output=True, text=True)
+        if r.returncode == 0:
+            sym = build_dir / "symbols.txt"
+            sym.write_text(r.stdout)
+            info["symbols"] = sym
+    return binary, tc, info
+
+
+# ---------------------------------------------------------------------------- commands
+
+def cmd_check(args):
+    _, tc, info = build(args, check_only=True)
+    mode = "assembly mode, ARM Thumb" if tc.arm else "native"
+    say(f"mbsim: {info['name']} compiles ({mode}). Warnings, if any, are listed above.")
+    say("       These come from desktop g++; the real CODAL build may warn differently.")
+    return 0
+
+
+def first_user_frame(text, src_dir):
+    for m in re.finditer(r"(/[^\s:]+):(\d+)", text):
+        try:
+            rel = Path(m.group(1)).resolve().relative_to(src_dir)
+        except ValueError:
+            continue
+        return f"{rel}:{m.group(2)}"
+    return None
+
+
+def cmd_run(args):
+    if not args.headless and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("'mbsim run' needs an interactive terminal. For scripts and tests add --headless.")
+    if not args.headless and (args.script or args.out or args.until is not None):
+        die("--script, --until and --out only apply with --headless")
+    if args.gdb and args.headless:
+        die("--gdb is for interactive runs")
+    if not 0.25 <= args.speed <= 4:
+        die("--speed must be between 0.25 and 4")
+
+    binary, tc, info = build(args)
+    if args.gdb and not tc.arm:
+        die("--gdb works in assembly mode only (add --arm, or include your .S file)")
+
+    cmd = [str(binary), "--name", info["name"], "--speed", str(args.speed)]
+    if args.seed is not None:
+        cmd += ["--seed", str(args.seed)]
+    if info["symbols"]:
+        cmd += ["--symbols", str(info["symbols"])]
+
+    out_dir = None
+    if args.headless:
+        out_dir = Path(args.out).expanduser().resolve() if args.out else CACHE / "runs" / info["build_id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cmd += ["--headless", "--out", str(out_dir), "--until", str(args.until if args.until is not None else 10000)]
+        if args.script:
+            script = Path(args.script).expanduser()
+            if not script.is_file():
+                die(f"{args.script}: no such script file")
+            cmd += ["--script", str(script.resolve())]
+    else:
+        cmd += ["--serial-log", str(CACHE / "serial.log")]
+
+    if tc.arm:
+        if not tc.qemu:
+            die("assembly mode needs qemu-arm to run the program:\n    sudo apt install qemu-user")
+        pre = [tc.qemu, "-cpu", "cortex-a15"]
+        if args.gdb:
+            pre += ["-g", "1234"]
+        cmd = pre + cmd
+
+    env = dict(os.environ)
+    stderr_log = None
+    if args.asan:
+        env["ASAN_OPTIONS"] = "exitcode=4:detect_leaks=0:" + env.get("ASAN_OPTIONS", "")
+        env["UBSAN_OPTIONS"] = "print_stacktrace=1:exitcode=4:" + env.get("UBSAN_OPTIONS", "")
+        stderr_log = CACHE / "last-stderr.log"
+
+    saved_tty = None
+    if not args.headless:
+        try:
+            import termios
+            saved_tty = termios.tcgetattr(sys.stdin.fileno())
+        except Exception:
+            saved_tty = None
+
+    def put_terminal_back():
+        # Safety net for exits where the program could not tidy up after itself (stopped
+        # by a sanitizer, or killed): leave the alternate screen, show the cursor, and
+        # restore the terminal's line settings.
+        if saved_tty is None:
+            return
+        try:
+            import termios
+            sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved_tty)
+        except Exception:
+            pass
+
+    def launch(stderr=None):
+        # If this command is told to stop (SIGTERM, terminal closed), pass that on, so the
+        # program gets to restore the terminal instead of being left running.
+        import signal
+        proc = subprocess.Popen(cmd, env=env, stderr=stderr)
+
+        def forward(signum, _frame):
+            try:
+                proc.send_signal(signum)
+            except ProcessLookupError:
+                pass
+
+        old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)}
+        try:
+            while True:
+                try:
+                    return proc.wait()
+                except KeyboardInterrupt:
+                    # Ctrl+C in headless mode reaches the program too; wait for it to exit.
+                    continue
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
+
+    while True:
+        if args.gdb:
+            gdb = which("gdb-multiarch") or "gdb-multiarch"
+            say("mbsim: the program is paused, waiting for a debugger. In another terminal run:")
+            say(f"    {gdb} -ex 'target remote :1234' {binary}")
+            say("  then use 'break <your function>', 'continue', 'stepi' and 'info registers'.")
+        if stderr_log:
+            with open(stderr_log, "w") as f:
+                rc = launch(stderr=f)
+            if rc == 4 or rc < 0:
+                put_terminal_back()
+            text = stderr_log.read_text(errors="replace")
+            sys.stderr.write(text)
+            if rc == 4:
+                where = first_user_frame(text, info["src_dir"])
+                if where:
+                    say(f"\nmbsim: the sanitizer stopped the program. First place in your code: {where}")
+        else:
+            rc = launch()
+            if rc < 0:
+                put_terminal_back()
+        if rc != EXIT_RESET or args.headless:
+            break
+        # 'r' was pressed: start again, like the reset button on the back of the board.
+
+    if rc < 0:
+        say(f"mbsim: the program was killed by signal {-rc}")
+        rc = 4
+    if args.headless:
+        meaning = {0: "finished", 3: "microbit_panic", 4: "crash", 5: "watchdog: no fiber yielded for 5 s"}
+        say(f"mbsim: headless run ended with exit code {rc} ({meaning.get(rc, 'error')}). Output files: {out_dir}")
+    elif rc == 3:
+        say("mbsim: the program called microbit_panic().")
+    return rc
+
+
+def cmd_doctor(_args):
+    ok = True
+
+    def row(good, label, detail, needed=True):
+        nonlocal ok
+        mark = "ok  " if good else ("FAIL" if needed else "--  ")
+        if not good and needed:
+            ok = False
+        print(f"  [{mark}] {label:<28} {detail}")
+
+    print("Needed for everything:")
+    gxx = which("g++")
+    ver = ""
+    if gxx:
+        ver = subprocess.run([gxx, "-dumpfullversion"], capture_output=True, text=True).stdout.strip()
+    major = int(ver.split(".")[0]) if ver.split(".")[0].isdigit() else 0
+    row(bool(gxx) and major >= 11, "g++ 11 or newer", f"g++ {ver}" if gxx else "missing: sudo apt install build-essential")
+    row(bool(which("make")), "make", which("make") or "missing: sudo apt install build-essential")
+    row(sys.version_info >= (3, 10), "Python 3.10 or newer", sys.version.split()[0])
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        writable = os.access(CACHE, os.W_OK)
+    except OSError:
+        writable = False
+    row(writable, "build folder", str(CACHE))
+    lib = CACHE / "lib-native.a"
+    row(lib.exists(), "runtime library", str(lib) if lib.exists() else "not built yet: run 'make' in " + str(REPO))
+
+    print("\nNeeded for assembly mode only (.S files, --arm):")
+    acc = which("arm-linux-gnueabihf-g++")
+    row(bool(acc), "ARM cross compiler", acc or "missing: sudo apt install g++-arm-linux-gnueabihf", needed=False)
+    qemu = which("qemu-arm", "qemu-arm-static")
+    row(bool(qemu), "ARM emulator (qemu-arm)", qemu or "missing: sudo apt install qemu-user", needed=False)
+    gdb = which("gdb-multiarch")
+    row(bool(gdb), "gdb-multiarch (for --gdb)", gdb or "optional: sudo apt install gdb-multiarch", needed=False)
+    if not (acc and qemu):
+        print("  Assembly mode is unavailable until both of the first two are installed.")
+
+    print("\nTerminal:")
+    tty = sys.stdout.isatty()
+    row(tty, "interactive terminal", "yes" if tty else "no (fine for --headless, needed for the live display)", needed=False)
+    ct = os.environ.get("COLORTERM", "")
+    true_colour = ct in ("truecolor", "24bit")
+    row(True, "colour", "24-bit colour" if true_colour else f"256 colours (COLORTERM={ct or 'unset'}; brightness steps will be coarser)")
+    enc = (sys.stdout.encoding or "").lower().replace("-", "")
+    row(enc == "utf8", "UTF-8 output", sys.stdout.encoding or "unknown", needed=False)
+    if tty:
+        cells = []
+        for v in (0, 15, 60, 120, 180, 255):
+            if v == 0:
+                cells.append("\x1b[38;5;240m··\x1b[0m")
+            elif true_colour:
+                cells.append(f"\x1b[38;2;{60 + 195 * v // 255};0;0m██\x1b[0m")
+            else:
+                cube = [52, 88, 124, 160, 196]
+                cells.append(f"\x1b[38;5;{cube[min(4, (195 * v // 255) * 5 // 196)]}m██\x1b[0m")
+        print("  LED brightness 0, 15, 60, 120, 180, 255:  " + "  ".join(cells))
+        print("  (the first should be grey dots; the rest red blocks from dim to bright)")
+
+    print("\n" + ("Everything needed is in place." if ok else "Something needed is missing; see FAIL above."))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="mbsim",
+        description="Build your own micro:bit CODAL main.cpp on this computer and run it with no board attached.",
+        epilog=KEYS + "\n\n" + FIDELITY,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", metavar="command")
+
+    run = sub.add_parser("run", help="build, then open the terminal simulator",
+                         epilog=KEYS + "\n\n" + FIDELITY,
+                         formatter_class=argparse.RawDescriptionHelpFormatter)
+    run.add_argument("path", help="your main.cpp, or the folder that holds it (every .c, .cpp and .S in a folder is built)")
+    run.add_argument("--seed", type=int, metavar="N", help="fix the random seed so a run can be repeated")
+    run.add_argument("--speed", type=float, default=1.0, metavar="F", help="scale simulated time, 0.25-4 (default 1)")
+    run.add_argument("--arm", action="store_true", help="force assembly mode (automatic when a .S file is present)")
+    run.add_argument("--asan", action="store_true", help="catch out-of-bounds array access (native mode only)")
+    run.add_argument("--gdb", action="store_true", help="assembly mode: wait for gdb-multiarch on port 1234")
+    run.add_argument("--headless", action="store_true", help="no UI; scripted input, results written to files")
+    run.add_argument("--script", metavar="FILE", help="headless: input script, one '<time_ms> <action> <target>' per line")
+    run.add_argument("--until", type=int, metavar="MS", help="headless: stop at this simulated time (default 10000)")
+    run.add_argument("--out", metavar="DIR", help="headless: folder for frames.txt, events.jsonl, serial.txt, sound.jsonl")
+
+    chk = sub.add_parser("check", help="compile only, with -Wall -Wextra, and print warnings")
+    chk.add_argument("path", help="your main.cpp, or the folder that holds it")
+    chk.add_argument("--arm", action="store_true", help="force assembly mode")
+
+    sub.add_parser("doctor", help="check dependencies and the terminal's colour support")
+
+    args = ap.parse_args()
+    if args.command == "run":
+        return cmd_run(args)
+    if args.command == "check":
+        return cmd_check(args)
+    if args.command == "doctor":
+        return cmd_doctor(args)
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
